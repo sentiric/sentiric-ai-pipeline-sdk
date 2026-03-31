@@ -24,3 +24,14 @@ orchestrator.run_pipeline(
 ```
 
 ---
+
+## 📦 Kurulum (Installation)
+Bu kütüphane doğrudan Sentiric platformunun Git depolarından çekilir. Projenizin `Cargo.toml` dosyasına aşağıdaki satırı ekleyin:
+
+```toml
+[dependencies]
+sentiric-ai-pipeline-sdk = { git = "https://github.com/sentiric/sentiric-ai-pipeline-sdk.git", tag = "v0.1.1" }
+```
+
+## 📦 Kurulum (Installation)
+Bu kütüphane doğrudan Sentiric platformunun Git depolarından çekilir. Projenizin 
