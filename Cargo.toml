@@ -1,0 +1,24 @@
+[package]
+name = "sentiric-ai-pipeline-sdk"
+version = "0.1.0"
+edition = "2021"
+authors = ["Sentiric Architecture Team"]
+description = "Sentiric Full-Duplex AI Pipeline SDK with Zero-Latency Barge-in"
+license = "AGPL-3.0"
+
+[dependencies]
+tokio = { version = "1.36", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tokio-util = "0.7"
+tonic = { version = "0.11", features = ["tls"] }
+prost = "0.12"
+async-stream = "0.3"
+futures = "0.3"
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Observability (SUTS v4.0)
+tracing = "0.1"
+
+# Contracts (Sentiric Ecosystem)
+sentiric-contracts = { git = "https://github.com/sentiric/sentiric-contracts.git", tag = "v1.20.1" }
