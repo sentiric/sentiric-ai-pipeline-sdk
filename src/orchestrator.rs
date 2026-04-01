@@ -42,7 +42,6 @@ impl PipelineOrchestrator {
             "🚀 AI Pipeline started."
         );
 
-        // [ARCH-COMPLIANCE] Edge-Mode telemetry and buffer optimization enforcement
         if self.config.edge_mode {
             info!(
                 event = "EDGE_MODE_ACTIVE",
@@ -53,7 +52,6 @@ impl PipelineOrchestrator {
             );
         }
 
-        // 1. Gelen sesi STT'ye yönlendirecek stream hazırlığı
         let (stt_req_tx, stt_req_rx) = mpsc::channel(128);
 
         tokio::spawn(async move {
@@ -72,7 +70,6 @@ impl PipelineOrchestrator {
             &tenant_id,
         );
 
-        // STT Akışını Başlat
         let mut stt_client = self.clients.stt.clone();
         let mut stt_response_stream = match stt_client.transcribe_stream(stt_request).await {
             Ok(res) => res.into_inner(),
@@ -91,13 +88,11 @@ impl PipelineOrchestrator {
 
         let mut cancel_token = CancellationToken::new();
 
-        // 2. STT Yanıtlarını Dinle (The Loop)
         while let Some(res) = stt_response_stream.next().await {
             match res {
                 Ok(msg) => {
                     let text = msg.partial_transcription.trim().to_string();
 
-                    // [BARGE-IN MANTIĞI] Eğer geçici metin varsa ve boş değilse, konuşma başlamış demektir.
                     if !msg.is_final {
                         if !text.is_empty() {
                             info!(
@@ -108,12 +103,12 @@ impl PipelineOrchestrator {
                                 "⚡ Barge-in detected. Cancelling active Dialog/TTS tasks."
                             );
 
-                            // Mevcut tüm işlem parçacıklarını anında iptal et (Zero-Latency)
                             cancel_token.cancel();
                             cancel_token = CancellationToken::new();
 
-                            // Eski sesin ağda kalmasını önlemek için flush sinyali olarak 0 byte gönder
-                            let _ = tx_audio.send(vec![]).await;
+                            // [ARCH-COMPLIANCE: Zafiyet 3 Düzeltmesi (Channel Deadlock Risk)]
+                            // Send.await ana STT döngüsünü bloke edebilir. Flush paketi için try_send zorunludur.
+                            let _ = tx_audio.try_send(vec![]);
                         }
                     } else if !text.is_empty() {
                         info!(
@@ -195,7 +190,6 @@ impl PipelineOrchestrator {
     ) -> Result<(), SdkError> {
         let (dialog_req_tx, dialog_req_rx) = mpsc::channel(10);
 
-        // 1. Config Payload
         let config_payload = StreamConversationRequest {
             payload: Some(DialogPayload::Config(ConversationConfig {
                 session_id,
@@ -208,7 +202,6 @@ impl PipelineOrchestrator {
             return Err(SdkError::Internal("Dialog channel closed early".into()));
         }
 
-        // 2. Metin Payload
         let text_payload = StreamConversationRequest {
             payload: Some(DialogPayload::TextInput(input_text)),
         };
@@ -223,71 +216,107 @@ impl PipelineOrchestrator {
             &tenant_id,
         );
 
-        let mut dialog_resp_stream = clients.dialog.stream_conversation(req).await?.into_inner();
+        // [ARCH-COMPLIANCE: Handshake Deadlock Koruması]
+        let dialog_resp_stream = tokio::select! {
+            _ = cancel_token.cancelled() => return Ok(()),
+            res = clients.dialog.stream_conversation(req) => res?.into_inner(),
+        };
 
+        let mut dialog_resp_stream = dialog_resp_stream;
         let mut sentence_buffer = String::new();
 
-        while let Some(res) = dialog_resp_stream.next().await {
-            if cancel_token.is_cancelled() {
-                return Ok(());
-            }
-
-            let msg = res?;
-            if let Some(sentiric_contracts::sentiric::dialog::v1::stream_conversation_response::Payload::TextResponse(text_chunk)) = msg.payload {
-                sentence_buffer.push_str(&text_chunk);
-
-                // Noktalama işaretinde cümleyi kes ve TTS'e yolla
-                if sentence_buffer.contains('.')
-                    || sentence_buffer.contains('?')
-                    || sentence_buffer.contains('!')
-                    || sentence_buffer.contains('\n')
-                {
-                    let sentence = sentence_buffer.clone();
-                    sentence_buffer.clear();
-
-                    let tts_req = SynthesizeStreamRequest {
-                        text: sentence,
-                        text_type: 1, // TEXT_TYPE_TEXT
-                        voice_id: config.tts_voice_id.clone(),
-                        audio_config: Some(AudioConfig {
-                            audio_format: 1, // PCM_S16LE
-                            sample_rate_hertz: config.tts_sample_rate as i32,
-                            volume_gain_db: 0.0,
-                        }),
-                        preferred_provider: "".to_string(),
-                        tuning: None,
-                        cloning_audio_data: None,
-                    };
-
-                    let req = clients.inject_metadata(
-                        tonic::Request::new(tts_req),
-                        &trace_id,
-                        &span_id,
-                        &tenant_id,
+        // [ARCH-COMPLIANCE: Zafiyet 2 Düzeltmesi (Dialog Zombie Task / Sızıntı Koruması)]
+        loop {
+            tokio::select! {
+                _ = cancel_token.cancelled() => {
+                    info!(
+                        event = "DIALOG_STREAM_ABORTED",
+                        trace_id = %trace_id,
+                        span_id = %span_id,
+                        tenant_id = %tenant_id,
+                        "Barge-in: Dropping ongoing Dialog task."
                     );
+                    return Ok(());
+                }
+                res_opt = dialog_resp_stream.next() => {
+                    match res_opt {
+                        Some(Ok(msg)) => {
+                            if let Some(sentiric_contracts::sentiric::dialog::v1::stream_conversation_response::Payload::TextResponse(text_chunk)) = msg.payload {
+                                sentence_buffer.push_str(&text_chunk);
 
-                    let mut tts_stream = clients.tts.synthesize_stream(req).await?.into_inner();
+                                if sentence_buffer.contains('.')
+                                    || sentence_buffer.contains('?')
+                                    || sentence_buffer.contains('!')
+                                    || sentence_buffer.contains('\n')
+                                {
+                                    let sentence = sentence_buffer.clone();
+                                    sentence_buffer.clear();
 
-                    // Sesi dışarıya bas, Barge-in gelirse anında kop.
-                    while let Some(audio_res) = tts_stream.next().await {
-                        tokio::select! {
-                            _ = cancel_token.cancelled() => {
-                                info!(
-                                    event = "TTS_STREAM_ABORTED",
-                                    trace_id = %trace_id,
-                                    span_id = %span_id,
-                                    tenant_id = %tenant_id,
-                                    "Barge-in: Dropping ongoing TTS audio stream."
-                                );
-                                return Ok(());
-                            }
-                            audio_msg = std::future::ready(audio_res) => {
-                                let chunk = audio_msg?.audio_content;
-                                if !chunk.is_empty() && tx_audio.send(chunk).await.is_err() {
-                                    return Err(SdkError::Internal("Audio output sender dropped".into()));
+                                    let tts_req = SynthesizeStreamRequest {
+                                        text: sentence,
+                                        text_type: 1,
+                                        voice_id: config.tts_voice_id.clone(),
+                                        audio_config: Some(AudioConfig {
+                                            audio_format: 1,
+                                            sample_rate_hertz: config.tts_sample_rate as i32,
+                                            volume_gain_db: 0.0,
+                                        }),
+                                        preferred_provider: "".to_string(),
+                                        tuning: None,
+                                        cloning_audio_data: None,
+                                    };
+
+                                    let req = clients.inject_metadata(
+                                        tonic::Request::new(tts_req),
+                                        &trace_id,
+                                        &span_id,
+                                        &tenant_id,
+                                    );
+
+                                    // Handshake koruması
+                                    let tts_stream = tokio::select! {
+                                        _ = cancel_token.cancelled() => return Ok(()),
+                                        res = clients.tts.synthesize_stream(req) => res?.into_inner(),
+                                    };
+
+                                    let mut tts_stream = tts_stream;
+
+                                    // [ARCH-COMPLIANCE: Zafiyet 1 Düzeltmesi (TTS Blocking I/O)]
+                                    // while let Some(..) bloğu yerine tam asenkron loop & select kullanımı
+                                    loop {
+                                        tokio::select! {
+                                            _ = cancel_token.cancelled() => {
+                                                info!(
+                                                    event = "TTS_STREAM_ABORTED",
+                                                    trace_id = %trace_id,
+                                                    span_id = %span_id,
+                                                    tenant_id = %tenant_id,
+                                                    "Barge-in: Dropping ongoing TTS audio stream."
+                                                );
+                                                return Ok(());
+                                            }
+                                            audio_res_opt = tts_stream.next() => {
+                                                match audio_res_opt {
+                                                    Some(Ok(audio_msg)) => {
+                                                        let chunk = audio_msg.audio_content;
+                                                        if !chunk.is_empty() && tx_audio.send(chunk).await.is_err() {
+                                                            return Err(SdkError::Internal("Audio output sender dropped".into()));
+                                                        }
+                                                    }
+                                                    Some(Err(e)) => {
+                                                        warn!(event="TTS_STREAM_ERROR", error=%e, "TTS inner stream error");
+                                                        break;
+                                                    }
+                                                    None => break,
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
+                        Some(Err(e)) => return Err(SdkError::GrpcError(e)),
+                        None => break, // Dialog Bitti
                     }
                 }
             }
