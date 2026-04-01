@@ -56,17 +56,20 @@ impl ApiClients {
     }
 
     async fn load_tls(config: &SdkConfig) -> Result<ClientTlsConfig, SdkError> {
-        let ca_cert = tokio::fs::read(&config.tls_ca_path)
-            .await
-            .map_err(|e| SdkError::TlsConfigError(format!("CA read error: {}", e)))?;
+        let ca_cert = tokio::fs::read(&config.tls_ca_path).await.map_err(|e| {
+            tracing::error!(event="SDK_TLS_ERROR", path=%config.tls_ca_path, error=%e, "CA Cert okunamadı. İzinleri kontrol edin.");
+            SdkError::TlsConfigError(format!("CA read error: {}", e))
+        })?;
         let ca = Certificate::from_pem(ca_cert);
 
-        let cert = tokio::fs::read(&config.tls_cert_path)
-            .await
-            .map_err(|e| SdkError::TlsConfigError(format!("Cert read error: {}", e)))?;
-        let key = tokio::fs::read(&config.tls_key_path)
-            .await
-            .map_err(|e| SdkError::TlsConfigError(format!("Key read error: {}", e)))?;
+        let cert = tokio::fs::read(&config.tls_cert_path).await.map_err(|e| {
+            tracing::error!(event="SDK_TLS_ERROR", path=%config.tls_cert_path, error=%e, "Cert okunamadı. İzinleri kontrol edin.");
+            SdkError::TlsConfigError(format!("Cert read error: {}", e))
+        })?;
+        let key = tokio::fs::read(&config.tls_key_path).await.map_err(|e| {
+            tracing::error!(event="SDK_TLS_ERROR", path=%config.tls_key_path, error=%e, "Key okunamadı. İzinleri kontrol edin.");
+            SdkError::TlsConfigError(format!("Key read error: {}", e))
+        })?;
         let identity = Identity::from_pem(cert, key);
 
         Ok(ClientTlsConfig::new()
