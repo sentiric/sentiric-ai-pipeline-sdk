@@ -1,3 +1,4 @@
+// File: sentiric-ai-pipeline-sdk/src/clients.rs
 use crate::config::SdkConfig;
 use crate::error::SdkError;
 use sentiric_contracts::sentiric::dialog::v1::dialog_service_client::DialogServiceClient;
@@ -28,29 +29,24 @@ impl ApiClients {
 
         let tls_config = Self::load_tls(config).await?;
 
+        // [ARCH-COMPLIANCE] Senkron .connect().await yerine .connect_lazy() yapıldı.
         let stt_channel = Endpoint::from_shared(config.stt_gateway_url.clone())
             .map_err(|e| SdkError::ConnectionError(e.to_string()))?
             .tls_config(tls_config.clone())
             .map_err(|e| SdkError::TlsConfigError(e.to_string()))?
-            .connect()
-            .await
-            .map_err(|e| SdkError::ConnectionError(e.to_string()))?;
+            .connect_lazy();
 
         let dialog_channel = Endpoint::from_shared(config.dialog_service_url.clone())
             .map_err(|e| SdkError::ConnectionError(e.to_string()))?
             .tls_config(tls_config.clone())
             .map_err(|e| SdkError::TlsConfigError(e.to_string()))?
-            .connect()
-            .await
-            .map_err(|e| SdkError::ConnectionError(e.to_string()))?;
+            .connect_lazy();
 
         let tts_channel = Endpoint::from_shared(config.tts_gateway_url.clone())
             .map_err(|e| SdkError::ConnectionError(e.to_string()))?
             .tls_config(tls_config)
             .map_err(|e| SdkError::TlsConfigError(e.to_string()))?
-            .connect()
-            .await
-            .map_err(|e| SdkError::ConnectionError(e.to_string()))?;
+            .connect_lazy();
 
         Ok(Self {
             stt: SttGatewayServiceClient::new(stt_channel),
