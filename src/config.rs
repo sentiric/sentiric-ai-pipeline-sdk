@@ -1,3 +1,5 @@
+// File: sentiric-ai-pipeline-sdk/src/config.rs
+
 #[derive(Debug, Clone)]
 pub struct SdkConfig {
     pub stt_gateway_url: String,
@@ -13,4 +15,7 @@ pub struct SdkConfig {
 
     pub tts_voice_id: String,
     pub tts_sample_rate: u32,
+
+    // [ARCH-COMPLIANCE] Nano-Edge IoT Profili (Ghost Mode / Telemetry Optimizasyonu)
+    pub edge_mode: bool,
 }

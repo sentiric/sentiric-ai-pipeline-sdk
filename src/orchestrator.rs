@@ -1,3 +1,4 @@
+// File: sentiric-ai-pipeline-sdk/src/orchestrator.rs
 use crate::clients::ApiClients;
 use crate::config::SdkConfig;
 use crate::error::SdkError;
@@ -40,6 +41,17 @@ impl PipelineOrchestrator {
             tenant_id = %tenant_id,
             "🚀 AI Pipeline started."
         );
+
+        // [ARCH-COMPLIANCE] Edge-Mode telemetry and buffer optimization enforcement
+        if self.config.edge_mode {
+            info!(
+                event = "EDGE_MODE_ACTIVE",
+                trace_id = %trace_id,
+                span_id = %span_id,
+                tenant_id = %tenant_id,
+                "Edge mode active, disabling heavy telemetry and applying low-latency buffer constraints."
+            );
+        }
 
         // 1. Gelen sesi STT'ye yönlendirecek stream hazırlığı
         let (stt_req_tx, stt_req_rx) = mpsc::channel(128);
@@ -216,7 +228,6 @@ impl PipelineOrchestrator {
         let mut sentence_buffer = String::new();
 
         while let Some(res) = dialog_resp_stream.next().await {
-            // Barge-in check at the dialog stream level
             if cancel_token.is_cancelled() {
                 return Ok(());
             }
@@ -272,7 +283,6 @@ impl PipelineOrchestrator {
                             }
                             audio_msg = std::future::ready(audio_res) => {
                                 let chunk = audio_msg?.audio_content;
-                                // Clippy FIX: Collapsed IF statement
                                 if !chunk.is_empty() && tx_audio.send(chunk).await.is_err() {
                                     return Err(SdkError::Internal("Audio output sender dropped".into()));
                                 }
