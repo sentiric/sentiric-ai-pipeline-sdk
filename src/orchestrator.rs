@@ -183,6 +183,17 @@ impl PipelineOrchestrator {
             return Err(SdkError::Internal("Dialog channel closed early".into()));
         }
 
+        // [CRITICAL FIX 1]: LLM'i tetiklemek için Dialog Service'e IsFinalInput gönderilmesi ZORUNLUDUR.
+        let final_trigger_payload = StreamConversationRequest {
+            payload: Some(DialogPayload::IsFinalInput(true)),
+        };
+        if dialog_req_tx.send(final_trigger_payload).await.is_err() {
+            return Err(SdkError::Internal("Dialog channel closed early".into()));
+        }
+
+        // Sender'ı düşürüyoruz ki gRPC stream istek yönünde kapansın ve cevap yönü dinlensin.
+        drop(dialog_req_tx);
+
         let req = clients.inject_metadata(
             tonic::Request::new(ReceiverStream::new(dialog_req_rx)),
             &trace_id,
@@ -207,69 +218,97 @@ impl PipelineOrchestrator {
                 res_opt = dialog_resp_stream.next() => {
                     match res_opt {
                         Some(Ok(msg)) => {
-                            if let Some(sentiric_contracts::sentiric::dialog::v1::stream_conversation_response::Payload::TextResponse(text_chunk)) = msg.payload {
-                                sentence_buffer.push_str(&text_chunk);
+                            match msg.payload {
+                                Some(sentiric_contracts::sentiric::dialog::v1::stream_conversation_response::Payload::TextResponse(text_chunk)) => {
+                                    sentence_buffer.push_str(&text_chunk);
 
-                                if sentence_buffer.contains('.') || sentence_buffer.contains('?') || sentence_buffer.contains('!') || sentence_buffer.contains('\n') {
-                                    let sentence = sentence_buffer.clone();
-                                    sentence_buffer.clear();
-
-                                    // AI'ın ürettiği metni UI'a gönderiyoruz
-                                    let _ = tx_out.try_send(PipelineEvent::Transcript(TranscriptData {
-                                        text: sentence.clone(),
-                                        is_final: true,
-                                        sender: "AI".to_string(),
-                                        emotion: "neutral".to_string(),
-                                        gender: "neutral".to_string(),
-                                    }));
-
-                                    let tts_req = SynthesizeStreamRequest {
-                                        text: sentence,
-                                        text_type: 1,
-                                        voice_id: config.tts_voice_id.clone(),
-                                        audio_config: Some(AudioConfig {
-                                            audio_format: 1,
-                                            sample_rate_hertz: config.tts_sample_rate as i32,
-                                            volume_gain_db: 0.0,
-                                        }),
-                                        preferred_provider: "".to_string(),
-                                        tuning: None,
-                                        cloning_audio_data: None,
-                                    };
-
-                                    let req = clients.inject_metadata(tonic::Request::new(tts_req), &trace_id, &span_id, &tenant_id);
-
-                                    let tts_stream = tokio::select! {
-                                        _ = cancel_token.cancelled() => return Ok(()),
-                                        res = clients.tts.synthesize_stream(req) => res?.into_inner(),
-                                    };
-
-                                    let mut tts_stream = tts_stream;
-
-                                    loop {
-                                        tokio::select! {
-                                            _ = cancel_token.cancelled() => {
-                                                info!(event = "TTS_STREAM_ABORTED", trace_id = %trace_id, "Barge-in: Dropping TTS audio.");
-                                                return Ok(());
-                                            }
-                                            audio_res_opt = tts_stream.next() => {
-                                                match audio_res_opt {
-                                                    Some(Ok(audio_msg)) => {
-                                                        let chunk = audio_msg.audio_content;
-                                                        if !chunk.is_empty() && tx_out.send(PipelineEvent::Audio(chunk)).await.is_err() {
-                                                            return Err(SdkError::Internal("Audio output sender dropped".into()));
-                                                        }
-                                                    }
-                                                    Some(Err(e)) => { warn!(event="TTS_STREAM_ERROR", error=%e, "TTS error"); break; }
-                                                    None => break,
-                                                }
-                                            }
-                                        }
+                                    // Noktalama işareti geldiğinde TTS'i tetikle
+                                    if sentence_buffer.contains('.') || sentence_buffer.contains('?') || sentence_buffer.contains('!') || sentence_buffer.contains('\n') {
+                                        let sentence = sentence_buffer.clone();
+                                        sentence_buffer.clear();
+                                        Self::synthesize_and_stream_tts(&mut clients, &config, sentence, &trace_id, &span_id, &tenant_id, &tx_out, &cancel_token).await?;
                                     }
                                 }
+                                Some(sentiric_contracts::sentiric::dialog::v1::stream_conversation_response::Payload::IsFinalResponse(true)) => {
+                                    // [CRITICAL FIX 2]: Diyalog bittiğinde cümlede noktalama işareti yoksa bile kalan buffer'ı TTS'e bas (Flush).
+                                    // Bu işlem Dialog'un "dialog.turn.completed" eventini RMQ'ya atmasıyla eşzamanlıdır, Crystalline burada uyanır.
+                                    if !sentence_buffer.trim().is_empty() {
+                                        let sentence = sentence_buffer.clone();
+                                        sentence_buffer.clear();
+                                        Self::synthesize_and_stream_tts(&mut clients, &config, sentence, &trace_id, &span_id, &tenant_id, &tx_out, &cancel_token).await?;
+                                    }
+                                }
+                                _ => {}
                             }
                         }
                         Some(Err(e)) => return Err(SdkError::GrpcError(e)),
+                        None => break,
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    // [REFACTOR]: Kod tekrarını önlemek ve Memory Safety sağlamak için TTS işlemini izole ettik.
+    #[allow(clippy::too_many_arguments)]
+    async fn synthesize_and_stream_tts(
+        clients: &mut ApiClients,
+        config: &SdkConfig,
+        sentence: String,
+        trace_id: &str,
+        span_id: &str,
+        tenant_id: &str,
+        tx_out: &mpsc::Sender<PipelineEvent>,
+        cancel_token: &CancellationToken,
+    ) -> Result<(), SdkError> {
+        let _ = tx_out.try_send(PipelineEvent::Transcript(TranscriptData {
+            text: sentence.clone(),
+            is_final: true,
+            sender: "AI".to_string(),
+            emotion: "neutral".to_string(),
+            gender: "neutral".to_string(),
+        }));
+
+        let tts_req = SynthesizeStreamRequest {
+            text: sentence,
+            text_type: 1,
+            voice_id: config.tts_voice_id.clone(),
+            audio_config: Some(AudioConfig {
+                audio_format: 1,
+                sample_rate_hertz: config.tts_sample_rate as i32,
+                volume_gain_db: 0.0,
+            }),
+            preferred_provider: "".to_string(),
+            tuning: None,
+            cloning_audio_data: None,
+        };
+
+        let req =
+            clients.inject_metadata(tonic::Request::new(tts_req), trace_id, span_id, tenant_id);
+
+        let tts_stream = tokio::select! {
+            _ = cancel_token.cancelled() => return Ok(()),
+            res = clients.tts.synthesize_stream(req) => res?.into_inner(),
+        };
+
+        let mut tts_stream = tts_stream;
+
+        loop {
+            tokio::select! {
+                _ = cancel_token.cancelled() => {
+                    info!(event = "TTS_STREAM_ABORTED", trace_id = %trace_id, "Barge-in: Dropping TTS audio.");
+                    return Ok(());
+                }
+                audio_res_opt = tts_stream.next() => {
+                    match audio_res_opt {
+                        Some(Ok(audio_msg)) => {
+                            let chunk = audio_msg.audio_content;
+                            if !chunk.is_empty() && tx_out.send(PipelineEvent::Audio(chunk)).await.is_err() {
+                                return Err(SdkError::Internal("Audio output sender dropped".into()));
+                            }
+                        }
+                        Some(Err(e)) => { warn!(event="TTS_STREAM_ERROR", error=%e, "TTS error"); break; }
                         None => break,
                     }
                 }
