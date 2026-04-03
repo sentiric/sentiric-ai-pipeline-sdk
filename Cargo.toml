@@ -1,6 +1,6 @@
 [package]
 name = "sentiric-ai-pipeline-sdk"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2021"
 authors = ["Sentiric Architecture Team"]
 description = "Sentiric Full-Duplex AI Pipeline SDK with Zero-Latency Barge-in"
@@ -20,5 +20,5 @@ thiserror = "1.0"
 # Observability (SUTS v4.0)
 tracing = "0.1"
 
-# Contracts (Sentiric Ecosystem)
-sentiric-contracts = { git = "https://github.com/sentiric/sentiric-contracts.git", tag = "v1.20.1" }
+# Contracts (Sentiric Ecosystem) - v1.20.3'e güncellendi
+sentiric-contracts = { git = "https://github.com/sentiric/sentiric-contracts.git", tag = "v1.20.3" }

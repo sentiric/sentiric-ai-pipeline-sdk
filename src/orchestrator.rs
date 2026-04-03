@@ -2,6 +2,7 @@
 use crate::clients::ApiClients;
 use crate::config::SdkConfig;
 use crate::error::SdkError;
+use crate::{PipelineEvent, TranscriptData};
 use futures::StreamExt;
 use sentiric_contracts::sentiric::dialog::v1::stream_conversation_request::Payload as DialogPayload;
 use sentiric_contracts::sentiric::dialog::v1::{ConversationConfig, StreamConversationRequest};
@@ -32,8 +33,8 @@ impl PipelineOrchestrator {
         span_id: String,
         tenant_id: String,
         mut rx_audio: mpsc::Receiver<Vec<u8>>,
-        tx_audio: mpsc::Sender<Vec<u8>>,
-        mut interrupt_rx: mpsc::Receiver<()>, // <--- [YENİ]: Donanımsal VAD Sinyali Kanalı
+        tx_out: mpsc::Sender<PipelineEvent>,
+        mut interrupt_rx: mpsc::Receiver<()>,
     ) -> Result<(), SdkError> {
         info!(
             event = "AI_PIPELINE_START",
@@ -41,7 +42,6 @@ impl PipelineOrchestrator {
             "🚀 AI Pipeline started."
         );
 
-        // nano modunda çalışırken edge_mode aktif ise, bazı ağır işlemleri atlayarak düşük gecikmeli bir deneyim sağlamak için konfigürasyonu logluyoruz.
         if self.config.edge_mode {
             info!(
                 event = "EDGE_MODE_ACTIVE",
@@ -81,10 +81,8 @@ impl PipelineOrchestrator {
 
         let mut cancel_token = CancellationToken::new();
 
-        // [ARCH-COMPLIANCE]: Asenkron Multiplexing. Hem STT'den gelen metni hem İstemciden gelen donanım kesmesini (VAD) dinler.
         loop {
             tokio::select! {
-                // 1. İSTEMCİDEN GELEN DONANIMSAL SÖZ KESME (ZERO-LATENCY BARGE-IN)
                 Some(()) = interrupt_rx.recv() => {
                     info!(
                         event = "HARDWARE_BARGE_IN_TRIGGERED",
@@ -93,22 +91,29 @@ impl PipelineOrchestrator {
                     );
                     cancel_token.cancel();
                     cancel_token = CancellationToken::new();
-                    let _ = tx_audio.try_send(vec![]); // Flush network buffer
+                    let _ = tx_out.try_send(PipelineEvent::ClearBuffer);
                 }
 
-                // 2. STT'DEN GELEN TRANSKRİPSİYON AKIŞI
                 res_opt = stt_response_stream.next() => {
                     match res_opt {
                         Some(Ok(msg)) => {
                             let text = msg.partial_transcription.trim().to_string();
 
-                            // Yazılımsal Söz Kesme (Fallback)
+                            // STT'den gelen metni ve duygu durumunu UI için dışarı aktar
+                            let _ = tx_out.try_send(PipelineEvent::Transcript(TranscriptData {
+                                text: text.clone(),
+                                is_final: msg.is_final,
+                                sender: "USER".to_string(),
+                                emotion: msg.emotion_proxy.clone(),
+                                gender: msg.gender_proxy.clone(),
+                            }));
+
                             if !msg.is_final {
                                 if !text.is_empty() {
                                     info!(event = "SOFTWARE_BARGE_IN_TRIGGERED", trace_id = %trace_id, "⚡ Text-based Barge-in detected.");
                                     cancel_token.cancel();
                                     cancel_token = CancellationToken::new();
-                                    let _ = tx_audio.try_send(vec![]);
+                                    let _ = tx_out.try_send(PipelineEvent::ClearBuffer);
                                 }
                             } else if !text.is_empty() {
                                 info!(event = "STT_FINAL_RECEIVED", trace_id = %trace_id, text = %text, "Final transcription received.");
@@ -116,7 +121,7 @@ impl PipelineOrchestrator {
                                 let ct = cancel_token.child_token();
                                 let clients_clone = self.clients.clone();
                                 let config_clone = self.config.clone();
-                                let tx_audio_clone = tx_audio.clone();
+                                let tx_out_clone = tx_out.clone();
                                 let s_id = session_id.clone();
                                 let u_id = user_id.clone();
                                 let tr_id = trace_id.clone();
@@ -125,7 +130,7 @@ impl PipelineOrchestrator {
 
                                 tokio::spawn(async move {
                                     if let Err(e) = Self::handle_dialog_tts_phase(
-                                        clients_clone, config_clone, s_id, u_id, tr_id.clone(), sp_id, ten_id, text, tx_audio_clone, ct
+                                        clients_clone, config_clone, s_id, u_id, tr_id.clone(), sp_id, ten_id, text, tx_out_clone, ct
                                     ).await {
                                         warn!(event = "DIALOG_TTS_ERROR", trace_id = %tr_id, error = %e, "Error during Dialog execution.");
                                     }
@@ -144,7 +149,6 @@ impl PipelineOrchestrator {
         Ok(())
     }
 
-    // handle_dialog_tts_phase metodu aynı kalıyor... (Önceki snapshot'taki gibi)
     #[allow(clippy::too_many_arguments)]
     async fn handle_dialog_tts_phase(
         mut clients: ApiClients,
@@ -155,7 +159,7 @@ impl PipelineOrchestrator {
         span_id: String,
         tenant_id: String,
         input_text: String,
-        tx_audio: mpsc::Sender<Vec<u8>>,
+        tx_out: mpsc::Sender<PipelineEvent>,
         cancel_token: CancellationToken,
     ) -> Result<(), SdkError> {
         let (dialog_req_tx, dialog_req_rx) = mpsc::channel(10);
@@ -210,6 +214,15 @@ impl PipelineOrchestrator {
                                     let sentence = sentence_buffer.clone();
                                     sentence_buffer.clear();
 
+                                    // AI'ın ürettiği metni UI'a gönderiyoruz
+                                    let _ = tx_out.try_send(PipelineEvent::Transcript(TranscriptData {
+                                        text: sentence.clone(),
+                                        is_final: true,
+                                        sender: "AI".to_string(),
+                                        emotion: "neutral".to_string(),
+                                        gender: "neutral".to_string(),
+                                    }));
+
                                     let tts_req = SynthesizeStreamRequest {
                                         text: sentence,
                                         text_type: 1,
@@ -243,7 +256,7 @@ impl PipelineOrchestrator {
                                                 match audio_res_opt {
                                                     Some(Ok(audio_msg)) => {
                                                         let chunk = audio_msg.audio_content;
-                                                        if !chunk.is_empty() && tx_audio.send(chunk).await.is_err() {
+                                                        if !chunk.is_empty() && tx_out.send(PipelineEvent::Audio(chunk)).await.is_err() {
                                                             return Err(SdkError::Internal("Audio output sender dropped".into()));
                                                         }
                                                     }
