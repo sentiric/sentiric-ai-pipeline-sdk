@@ -1,37 +1,12 @@
-# 🧠 Sentiric AI Pipeline SDK
+# 🧠 Sentiric Ai Pipeline Sdk
 
-**Sentiric İletişim İşletim Sistemi** için Full-Duplex AI Senkronizasyon Motoru. 
+Platformun Ses ve Zeka Senkronizasyon Motoru. STT, Dialog ve TTS servisleri arasındaki akışları kilitlenmesiz yönetir.
 
-Bu kütüphane, STT, Dialog ve TTS servisleri arasındaki akışları (Streaming) kilitlenmesiz (Lock-Free) olarak orkestre eder. VAD tamponlaması ve Sıfır-Gecikmeli Söz Kesme (Zero-Latency Barge-in) mekanizmasını işletir.
-
-## 🏛️ Mimari Kurallar (Constitutional Constraints)
-1. **SUTS v4.0 Uyumlu:** SDK, kendi `tracing_subscriber`'ını başlatmaz. Gömüldüğü servisin (ör: `telephony-action-service`) konfigürasyonunu kullanır. Tüm olaylar `x-trace-id`, `x-span-id` ve `x-tenant-id` ile etiketlenir.
-2. **mTLS Zorunluluğu:** Uzman motorlara (STT, Dialog, TTS) yapılan gRPC bağlantılarında HTTP fallback YASAKTIR. Tüm iletişim Zero-Trust mTLS ile şifrelenmelidir.
-3. **No Panic Policy:** Kütüphane hiçbir koşulda çökmeyecek (panic) şekilde tasarlanmıştır.
-
-## 🚀 Kullanım (Usage)
-```rust
-use sentiric_ai_pipeline_sdk::config::SdkConfig;
-use sentiric_ai_pipeline_sdk::orchestrator::PipelineOrchestrator;
-use tokio::sync::mpsc;
-
-let config = SdkConfig { /* ... */ };
-let orchestrator = PipelineOrchestrator::new(config).await?;
-
-orchestrator.run_pipeline(
-    session_id, user_id, trace_id, span_id, tenant_id, rx_audio, tx_audio
-).await?;
+## 🚀 Hızlı Başlangıç
+```bash
+cargo build
 ```
 
----
-
-## 📦 Kurulum (Installation)
-Bu kütüphane doğrudan Sentiric platformunun Git depolarından çekilir. Projenizin `Cargo.toml` dosyasına aşağıdaki satırı ekleyin:
-
-```toml
-[dependencies]
-sentiric-ai-pipeline-sdk = { git = "https://github.com/sentiric/sentiric-ai-pipeline-sdk.git", tag = "v0.1.1" }
-```
-
-## 📦 Kurulum (Installation)
-Bu kütüphane doğrudan Sentiric platformunun Git depolarından çekilir. Projenizin 
+## 🏛️ Mimari ve Mantık
+* **Geliştirici Kuralları:** Gizli [.context.md](.context.md) dosyasını okuyun (AI Ajanları için zorunludur).
+* **Anayasal Konum:** [sentiric-spec/spec/libraries/ai-pipeline-sdk.yaml](https://github.com/sentiric/sentiric-spec)
