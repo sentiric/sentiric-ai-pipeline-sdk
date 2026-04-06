@@ -86,6 +86,7 @@ impl PipelineOrchestrator {
         };
 
         let mut cancel_token = CancellationToken::new();
+
         let mut acoustic_state = AcousticState {
             last_arousal: 0.0,
             last_valence: 0.0,
@@ -110,7 +111,7 @@ impl PipelineOrchestrator {
                         Some(Ok(msg)) => {
                             let text = msg.partial_transcription.trim().to_string();
 
-                            // [ARCH-COMPLIANCE FIX]: UI için Kelimeleri Map Et
+                            // UI için Kelimeleri Map Et
                             let mapped_words: Vec<WordData> = msg.words.into_iter().map(|w| WordData {
                                 word: w.word,
                                 start: w.start,
@@ -136,12 +137,18 @@ impl PipelineOrchestrator {
                                 words: mapped_words,
                             }));
 
-                            // [DEEP WATERS]: Duygu durumunda (Arousal/Tempo) ciddi değişim var mı?
+                            // -------------------------------------------------------------------------
+                            // 🌊 [DEEP WATERS]: Duygu durumunda (Arousal/Tempo) ciddi değişim var mı?
+                            // -------------------------------------------------------------------------
+                            // Yalnızca "is_final" anında (Cümle bittiğinde) hesaplıyoruz ki
+                            // hece hece gereksiz yere event fırlatmayalım.
                             if msg.is_final && current_arousal > 0.0 {
                                 let arousal_diff = (current_arousal - acoustic_state.last_arousal).abs();
 
-                                // Eğer uyarılmışlık %30'dan fazla oynadıysa veya mood değiştiyse
+                                // Eğer uyarılmışlık %30'dan fazla oynadıysa (Heyecan veya Sakinleşme)
+                                // VEYA ana mod değiştiyse (Örn: neutral -> angry)
                                 if acoustic_state.last_arousal > 0.0 && (arousal_diff > 0.3 || msg.emotion_proxy != acoustic_state.current_mood) {
+
                                     debug!(event="DEEP_WATERS_TRIGGERED", trace_id=%trace_id, "Akustik mod değişimi yakalandı! Arousal Diff: {}", arousal_diff);
 
                                     // Eventi Gateaway üzerinden RMQ'ya fırlatılması için gönder
@@ -154,6 +161,7 @@ impl PipelineOrchestrator {
                                     });
                                 }
 
+                                // Hafızayı bir sonraki cümle için güncelle
                                 acoustic_state.last_arousal = current_arousal;
                                 acoustic_state.last_valence = current_valence;
                                 acoustic_state.current_mood = msg.emotion_proxy.clone();
