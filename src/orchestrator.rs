@@ -2,7 +2,7 @@
 use crate::clients::ApiClients;
 use crate::config::SdkConfig;
 use crate::error::SdkError;
-use crate::{PipelineEvent, TranscriptData};
+use crate::{PipelineEvent, TranscriptData, WordData};
 use futures::StreamExt;
 use sentiric_contracts::sentiric::dialog::v1::stream_conversation_request::Payload as DialogPayload;
 use sentiric_contracts::sentiric::dialog::v1::{ConversationConfig, StreamConversationRequest};
@@ -11,11 +11,18 @@ use sentiric_contracts::sentiric::tts::v1::{AudioConfig, SynthesizeStreamRequest
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 pub struct PipelineOrchestrator {
     config: SdkConfig,
     clients: ApiClients,
+}
+
+// "Deep Waters" State Takibi İçin Basit Bir Hafıza Yapısı
+struct AcousticState {
+    last_arousal: f32,
+    last_valence: f32,
+    current_mood: String,
 }
 
 impl PipelineOrchestrator {
@@ -39,15 +46,14 @@ impl PipelineOrchestrator {
         info!(
             event = "AI_PIPELINE_START",
             trace_id = %trace_id, span_id = %span_id, tenant_id = %tenant_id,
+            listen_only = self.config.listen_only_mode,
             "🚀 AI Pipeline started."
         );
 
         if self.config.edge_mode {
             info!(
                 event = "EDGE_MODE_ACTIVE",
-                trace_id = %trace_id,
-                span_id = %span_id,
-                tenant_id = %tenant_id,
+                trace_id = %trace_id, span_id = %span_id, tenant_id = %tenant_id,
                 "Edge mode active, disabling heavy telemetry and applying low-latency buffer constraints."
             );
         }
@@ -80,6 +86,11 @@ impl PipelineOrchestrator {
         };
 
         let mut cancel_token = CancellationToken::new();
+        let mut acoustic_state = AcousticState {
+            last_arousal: 0.0,
+            last_valence: 0.0,
+            current_mood: "neutral".to_string(),
+        };
 
         loop {
             tokio::select! {
@@ -99,17 +110,57 @@ impl PipelineOrchestrator {
                         Some(Ok(msg)) => {
                             let text = msg.partial_transcription.trim().to_string();
 
-                            // STT'den gelen metni ve duygu durumunu UI için dışarı aktar
+                            // [ARCH-COMPLIANCE FIX]: UI için Kelimeleri Map Et
+                            let mapped_words: Vec<WordData> = msg.words.into_iter().map(|w| WordData {
+                                word: w.word,
+                                start: w.start,
+                                end: w.end,
+                                probability: w.probability,
+                            }).collect();
+
+                            let current_arousal = msg.arousal;
+                            let current_valence = msg.valence;
+                            let speaker_id = msg.speaker_id.clone();
+
+                            // STT'den gelen zengin metni ve duygu durumunu UI için dışarı aktar
                             let _ = tx_out.try_send(PipelineEvent::Transcript(TranscriptData {
                                 text: text.clone(),
                                 is_final: msg.is_final,
                                 sender: "USER".to_string(),
                                 emotion: msg.emotion_proxy.clone(),
                                 gender: msg.gender_proxy.clone(),
+                                arousal: current_arousal,
+                                valence: current_valence,
+                                speaker_id: speaker_id.clone(),
+                                speaker_vec: msg.speaker_vec.clone(),
+                                words: mapped_words,
                             }));
 
+                            // [DEEP WATERS]: Duygu durumunda (Arousal/Tempo) ciddi değişim var mı?
+                            if msg.is_final && current_arousal > 0.0 {
+                                let arousal_diff = (current_arousal - acoustic_state.last_arousal).abs();
+
+                                // Eğer uyarılmışlık %30'dan fazla oynadıysa veya mood değiştiyse
+                                if acoustic_state.last_arousal > 0.0 && (arousal_diff > 0.3 || msg.emotion_proxy != acoustic_state.current_mood) {
+                                    debug!(event="DEEP_WATERS_TRIGGERED", trace_id=%trace_id, "Akustik mod değişimi yakalandı! Arousal Diff: {}", arousal_diff);
+
+                                    // Eventi Gateaway üzerinden RMQ'ya fırlatılması için gönder
+                                    let _ = tx_out.try_send(PipelineEvent::AcousticMoodShifted {
+                                        previous_mood: acoustic_state.current_mood.clone(),
+                                        current_mood: msg.emotion_proxy.clone(),
+                                        arousal_shift: current_arousal - acoustic_state.last_arousal,
+                                        valence_shift: current_valence - acoustic_state.last_valence,
+                                        speaker_id: speaker_id.clone()
+                                    });
+                                }
+
+                                acoustic_state.last_arousal = current_arousal;
+                                acoustic_state.last_valence = current_valence;
+                                acoustic_state.current_mood = msg.emotion_proxy.clone();
+                            }
+
                             if !msg.is_final {
-                                if !text.is_empty() {
+                                if !text.is_empty() && !self.config.listen_only_mode {
                                     info!(event = "SOFTWARE_BARGE_IN_TRIGGERED", trace_id = %trace_id, "⚡ Text-based Barge-in detected.");
                                     cancel_token.cancel();
                                     cancel_token = CancellationToken::new();
@@ -117,6 +168,12 @@ impl PipelineOrchestrator {
                                 }
                             } else if !text.is_empty() {
                                 info!(event = "STT_FINAL_RECEIVED", trace_id = %trace_id, text = %text, "Final transcription received.");
+
+                                // [ARCH-COMPLIANCE FIX]: Listen-Only Mode kontrolü. Sadece dinleyici isek yanıt üretme!
+                                if self.config.listen_only_mode {
+                                    debug!(event = "LISTEN_ONLY_SKIP", trace_id = %trace_id, "Listen-only mode active. Skipping Dialog and TTS generation.");
+                                    continue;
+                                }
 
                                 let ct = cancel_token.child_token();
                                 let clients_clone = self.clients.clone();
@@ -183,7 +240,6 @@ impl PipelineOrchestrator {
             return Err(SdkError::Internal("Dialog channel closed early".into()));
         }
 
-        // [CRITICAL FIX 1]: LLM'i tetiklemek için Dialog Service'e IsFinalInput gönderilmesi ZORUNLUDUR.
         let final_trigger_payload = StreamConversationRequest {
             payload: Some(DialogPayload::IsFinalInput(true)),
         };
@@ -191,7 +247,6 @@ impl PipelineOrchestrator {
             return Err(SdkError::Internal("Dialog channel closed early".into()));
         }
 
-        // Sender'ı düşürüyoruz ki gRPC stream istek yönünde kapansın ve cevap yönü dinlensin.
         drop(dialog_req_tx);
 
         let req = clients.inject_metadata(
@@ -222,7 +277,6 @@ impl PipelineOrchestrator {
                                 Some(sentiric_contracts::sentiric::dialog::v1::stream_conversation_response::Payload::TextResponse(text_chunk)) => {
                                     sentence_buffer.push_str(&text_chunk);
 
-                                    // Noktalama işareti geldiğinde TTS'i tetikle
                                     if sentence_buffer.contains('.') || sentence_buffer.contains('?') || sentence_buffer.contains('!') || sentence_buffer.contains('\n') {
                                         let sentence = sentence_buffer.clone();
                                         sentence_buffer.clear();
@@ -230,8 +284,6 @@ impl PipelineOrchestrator {
                                     }
                                 }
                                 Some(sentiric_contracts::sentiric::dialog::v1::stream_conversation_response::Payload::IsFinalResponse(true)) => {
-                                    // [CRITICAL FIX 2]: Diyalog bittiğinde cümlede noktalama işareti yoksa bile kalan buffer'ı TTS'e bas (Flush).
-                                    // Bu işlem Dialog'un "dialog.turn.completed" eventini RMQ'ya atmasıyla eşzamanlıdır, Crystalline burada uyanır.
                                     if !sentence_buffer.trim().is_empty() {
                                         let sentence = sentence_buffer.clone();
                                         sentence_buffer.clear();
@@ -250,7 +302,6 @@ impl PipelineOrchestrator {
         Ok(())
     }
 
-    // [REFACTOR]: Kod tekrarını önlemek ve Memory Safety sağlamak için TTS işlemini izole ettik.
     #[allow(clippy::too_many_arguments)]
     async fn synthesize_and_stream_tts(
         clients: &mut ApiClients,
@@ -268,6 +319,11 @@ impl PipelineOrchestrator {
             sender: "AI".to_string(),
             emotion: "neutral".to_string(),
             gender: "neutral".to_string(),
+            arousal: 0.0,
+            valence: 0.0,
+            speaker_id: "AI_1".to_string(),
+            speaker_vec: vec![],
+            words: vec![],
         }));
 
         let tts_req = SynthesizeStreamRequest {
