@@ -23,6 +23,7 @@ struct AcousticState {
     last_arousal: f32,
     last_valence: f32,
     current_mood: String,
+    speaker_id: String, // [YENİ]: Şizofreni koruması için
 }
 
 impl PipelineOrchestrator {
@@ -91,6 +92,7 @@ impl PipelineOrchestrator {
             last_arousal: 0.0,
             last_valence: 0.0,
             current_mood: "neutral".to_string(),
+            speaker_id: "".to_string(), // [YENİ]
         };
 
         loop {
@@ -145,13 +147,13 @@ impl PipelineOrchestrator {
                             if msg.is_final && current_arousal > 0.0 {
                                 let arousal_diff = (current_arousal - acoustic_state.last_arousal).abs();
 
-                                // Eğer uyarılmışlık %30'dan fazla oynadıysa (Heyecan veya Sakinleşme)
-                                // VEYA ana mod değiştiyse (Örn: neutral -> angry)
-                                if acoustic_state.last_arousal > 0.0 && (arousal_diff > 0.3 || msg.emotion_proxy != acoustic_state.current_mood) {
+                                // SADECE AYNI KİŞİ İSE ve DEĞİŞİM BELİRGİNSE (Eşik 0.3'ten 0.15'e çekildi)
+                                if acoustic_state.last_arousal > 0.0
+                                    && acoustic_state.speaker_id == speaker_id
+                                    && (arousal_diff > 0.15 || msg.emotion_proxy != acoustic_state.current_mood) {
 
-                                    debug!(event="DEEP_WATERS_TRIGGERED", trace_id=%trace_id, "Akustik mod değişimi yakalandı! Arousal Diff: {}", arousal_diff);
+                                    debug!(event="DEEP_WATERS_TRIGGERED", trace_id=%trace_id, "Akustik mod değişimi! Fark: {:.2}", arousal_diff);
 
-                                    // Eventi Gateaway üzerinden RMQ'ya fırlatılması için gönder
                                     let _ = tx_out.try_send(PipelineEvent::AcousticMoodShifted {
                                         previous_mood: acoustic_state.current_mood.clone(),
                                         current_mood: msg.emotion_proxy.clone(),
@@ -161,10 +163,11 @@ impl PipelineOrchestrator {
                                     });
                                 }
 
-                                // Hafızayı bir sonraki cümle için güncelle
+                                // Hafızayı güncelle
                                 acoustic_state.last_arousal = current_arousal;
                                 acoustic_state.last_valence = current_valence;
                                 acoustic_state.current_mood = msg.emotion_proxy.clone();
+                                acoustic_state.speaker_id = speaker_id.clone();
                             }
 
                             if !msg.is_final {
