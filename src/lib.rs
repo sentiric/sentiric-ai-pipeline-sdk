@@ -8,7 +8,6 @@ pub use config::SdkConfig;
 pub use error::SdkError;
 pub use orchestrator::PipelineOrchestrator;
 
-// [YENİ]: Kelime (Token) zamanlamaları ve olasılıkları
 #[derive(Debug, Clone)]
 pub struct WordData {
     pub word: String,
@@ -17,7 +16,6 @@ pub struct WordData {
     pub probability: f32,
 }
 
-// [ARCH-COMPLIANCE FIX]: Zengin Affective ve Diarization verisi
 #[derive(Debug, Clone)]
 pub struct TranscriptData {
     pub text: String,
@@ -32,12 +30,18 @@ pub struct TranscriptData {
     pub words: Vec<WordData>,
 }
 
+// [YENİ]: Artık Pipeline sadece ses değil, metin de alabilir!
+#[derive(Debug, Clone)]
+pub enum PipelineInputEvent {
+    Audio(Vec<u8>),
+    Text(String),
+}
+
 #[derive(Debug, Clone)]
 pub enum PipelineEvent {
     Audio(Vec<u8>),
     Transcript(TranscriptData),
     ClearBuffer,
-    // [YENİ]: RMQ'ya fırlatılacak AcousticMoodShifted event payload'u (Deep Waters)
     AcousticMoodShifted {
         previous_mood: String,
         current_mood: String,

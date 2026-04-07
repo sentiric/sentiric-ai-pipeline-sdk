@@ -1,5 +1,4 @@
 // Dosya: src/config.rs
-
 #[derive(Debug, Clone)]
 pub struct SdkConfig {
     pub stt_gateway_url: String,
@@ -17,7 +16,8 @@ pub struct SdkConfig {
     pub tts_sample_rate: u32,
 
     pub edge_mode: bool,
-
-    // [YENİ]: Otonom mod yerine sadece gözlemci (Toplantı/Analiz) modu
     pub listen_only_mode: bool,
+
+    // [YENİ]: Megafon / Broadcast Modu
+    pub speak_only_mode: bool,
 }

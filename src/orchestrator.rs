@@ -1,8 +1,8 @@
-// File: sentiric-ai-pipeline-sdk/src/orchestrator.rs
+// File: src/orchestrator.rs
 use crate::clients::ApiClients;
 use crate::config::SdkConfig;
 use crate::error::SdkError;
-use crate::{PipelineEvent, TranscriptData, WordData};
+use crate::{PipelineEvent, PipelineInputEvent, TranscriptData, WordData};
 use futures::StreamExt;
 use sentiric_contracts::sentiric::dialog::v1::stream_conversation_request::Payload as DialogPayload;
 use sentiric_contracts::sentiric::dialog::v1::{ConversationConfig, StreamConversationRequest};
@@ -18,12 +18,11 @@ pub struct PipelineOrchestrator {
     clients: ApiClients,
 }
 
-// "Deep Waters" State Takibi İçin Basit Bir Hafıza Yapısı
 struct AcousticState {
     last_arousal: f32,
     last_valence: f32,
     current_mood: String,
-    speaker_id: String, // [YENİ]: Şizofreni koruması için
+    speaker_id: String,
 }
 
 impl PipelineOrchestrator {
@@ -40,7 +39,8 @@ impl PipelineOrchestrator {
         trace_id: String,
         span_id: String,
         tenant_id: String,
-        mut rx_audio: mpsc::Receiver<Vec<u8>>,
+        // [ARCH-COMPLIANCE FIX]: Sadece Audio değil, Text de alabilen Input Event
+        mut rx_input: mpsc::Receiver<PipelineInputEvent>,
         tx_out: mpsc::Sender<PipelineEvent>,
         mut interrupt_rx: mpsc::Receiver<()>,
     ) -> Result<(), SdkError> {
@@ -48,11 +48,12 @@ impl PipelineOrchestrator {
             event = "AI_PIPELINE_START",
             trace_id = %trace_id, span_id = %span_id, tenant_id = %tenant_id,
             listen_only = self.config.listen_only_mode,
+            speak_only = self.config.speak_only_mode,
             "🚀 AI Pipeline started."
         );
 
         if self.config.edge_mode {
-            info!(
+            debug!(
                 event = "EDGE_MODE_ACTIVE",
                 trace_id = %trace_id, span_id = %span_id, tenant_id = %tenant_id,
                 "Edge mode active, disabling heavy telemetry and applying low-latency buffer constraints."
@@ -60,161 +61,153 @@ impl PipelineOrchestrator {
         }
 
         let (stt_req_tx, stt_req_rx) = mpsc::channel(128);
+        let (text_trigger_tx, mut text_trigger_rx) = mpsc::channel::<String>(128);
+        let is_speak_only = self.config.speak_only_mode;
 
+        // 1. Giriş Yönlendiricisi (Router)
         tokio::spawn(async move {
-            while let Some(chunk) = rx_audio.recv().await {
-                let req = TranscribeStreamRequest { audio_chunk: chunk };
-                if stt_req_tx.send(req).await.is_err() {
-                    break;
+            while let Some(input) = rx_input.recv().await {
+                match input {
+                    PipelineInputEvent::Audio(chunk) => {
+                        // Megafon modundaysak gelen sesleri yoksay (STT'yi yorma)
+                        if !is_speak_only {
+                            let req = TranscribeStreamRequest { audio_chunk: chunk };
+                            if stt_req_tx.send(req).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    PipelineInputEvent::Text(text) => {
+                        // Web'den veya API'den gelen direkt metin
+                        if text_trigger_tx.send(text).await.is_err() {
+                            break;
+                        }
+                    }
                 }
             }
         });
 
-        let stt_request = self.clients.inject_metadata(
-            tonic::Request::new(ReceiverStream::new(stt_req_rx)),
-            &trace_id,
-            &span_id,
-            &tenant_id,
-        );
-
-        let mut stt_client = self.clients.stt.clone();
-        let mut stt_response_stream = match stt_client.transcribe_stream(stt_request).await {
-            Ok(res) => res.into_inner(),
-            Err(e) => {
-                error!(event = "STT_CONNECT_FAIL", trace_id = %trace_id, error = %e, "Failed to connect to STT.");
-                return Err(e.into());
+        // 2. STT Bağlantısı (Eğer Speak-Only DEĞİLSE bağlan)
+        let mut stt_response_stream = None;
+        if !self.config.speak_only_mode {
+            let stt_request = self.clients.inject_metadata(
+                tonic::Request::new(ReceiverStream::new(stt_req_rx)),
+                &trace_id,
+                &span_id,
+                &tenant_id,
+            );
+            let mut stt_client = self.clients.stt.clone();
+            match stt_client.transcribe_stream(stt_request).await {
+                Ok(res) => stt_response_stream = Some(res.into_inner()),
+                Err(e) => {
+                    error!(event = "STT_CONNECT_FAIL", trace_id = %trace_id, error = %e, "Failed to connect to STT.");
+                    return Err(e.into());
+                }
             }
-        };
+        }
 
         let mut cancel_token = CancellationToken::new();
-
         let mut acoustic_state = AcousticState {
             last_arousal: 0.0,
             last_valence: 0.0,
             current_mood: "neutral".to_string(),
-            speaker_id: "".to_string(), // [YENİ]
+            speaker_id: "".to_string(),
         };
 
         loop {
             tokio::select! {
+                // DONANIM KESİNTİSİ (VAD)
                 Some(()) = interrupt_rx.recv() => {
-                    info!(
-                        event = "HARDWARE_BARGE_IN_TRIGGERED",
-                        trace_id = %trace_id, span_id = %span_id, tenant_id = %tenant_id,
-                        "⚡ Hardware VAD signal received from client. Cancelling Dialog/TTS tasks instantly."
-                    );
+                    info!(event = "HARDWARE_BARGE_IN_TRIGGERED", trace_id = %trace_id, "⚡ VAD signal received. Cancelling Tasks.");
                     cancel_token.cancel();
                     cancel_token = CancellationToken::new();
                     let _ = tx_out.try_send(PipelineEvent::ClearBuffer);
                 }
 
-                res_opt = stt_response_stream.next() => {
+                // DİREKT METİN GİRİŞİ (YENİ: MEGAFON VEYA CHAT)
+                Some(text) = text_trigger_rx.recv() => {
+                    info!(event = "TEXT_INPUT_RECEIVED", trace_id = %trace_id, text = %text, "Direct text input received.");
+                    cancel_token.cancel();
+                    cancel_token = CancellationToken::new();
+                    let _ = tx_out.try_send(PipelineEvent::ClearBuffer);
+
+                    let ct = cancel_token.child_token();
+                    let mut clients_clone = self.clients.clone();
+                    let config_clone = self.config.clone();
+                    let tx_out_clone = tx_out.clone();
+                    let s_id = session_id.clone();
+                    let u_id = user_id.clone();
+                    let tr_id = trace_id.clone();
+                    let sp_id = span_id.clone();
+                    let ten_id = tenant_id.clone();
+
+                    tokio::spawn(async move {
+                        if config_clone.speak_only_mode {
+                            // DİREKT TTS'E GÖNDER (Bypass Dialog)
+                            let _ = Self::synthesize_and_stream_tts(&mut clients_clone, &config_clone, text, &tr_id, &sp_id, &ten_id, &tx_out_clone, &ct).await;
+                        } else {
+                            // NORMAL AKIŞ (Omni-Chat mantığı: Metni AI Dialog'a gönder)
+                            if let Err(e) = Self::handle_dialog_tts_phase(
+                                clients_clone, config_clone, s_id, u_id, tr_id.clone(), sp_id, ten_id, text, tx_out_clone, ct
+                            ).await {
+                                warn!(event = "DIALOG_TTS_ERROR", trace_id = %tr_id, error = %e, "Error during Dialog execution.");
+                            }
+                        }
+                    });
+                }
+
+                // STT'DEN GELEN SES (GELENEKSEL AKIŞ)
+                res_opt = async {
+                    if let Some(stream) = stt_response_stream.as_mut() { stream.next().await }
+                    else { futures::future::pending().await }
+                } => {
                     match res_opt {
                         Some(Ok(msg)) => {
                             let text = msg.partial_transcription.trim().to_string();
+                            let mapped_words: Vec<WordData> = msg.words.into_iter().map(|w| WordData { word: w.word, start: w.start, end: w.end, probability: w.probability }).collect();
+                            let current_arousal = msg.arousal; let current_valence = msg.valence; let speaker_id = msg.speaker_id.clone();
 
-                            // UI için Kelimeleri Map Et
-                            let mapped_words: Vec<WordData> = msg.words.into_iter().map(|w| WordData {
-                                word: w.word,
-                                start: w.start,
-                                end: w.end,
-                                probability: w.probability,
-                            }).collect();
-
-                            let current_arousal = msg.arousal;
-                            let current_valence = msg.valence;
-                            let speaker_id = msg.speaker_id.clone();
-
-                            // STT'den gelen zengin metni ve duygu durumunu UI için dışarı aktar
                             let _ = tx_out.try_send(PipelineEvent::Transcript(TranscriptData {
-                                text: text.clone(),
-                                is_final: msg.is_final,
-                                sender: "USER".to_string(),
-                                emotion: msg.emotion_proxy.clone(),
-                                gender: msg.gender_proxy.clone(),
-                                arousal: current_arousal,
-                                valence: current_valence,
-                                speaker_id: speaker_id.clone(),
-                                speaker_vec: msg.speaker_vec.clone(),
-                                words: mapped_words,
+                                text: text.clone(), is_final: msg.is_final, sender: "USER".to_string(), emotion: msg.emotion_proxy.clone(), gender: msg.gender_proxy.clone(),
+                                arousal: current_arousal, valence: current_valence, speaker_id: speaker_id.clone(), speaker_vec: msg.speaker_vec.clone(), words: mapped_words,
                             }));
 
-                            // -------------------------------------------------------------------------
-                            // 🌊 [DEEP WATERS]: Duygu durumunda (Arousal/Tempo) ciddi değişim var mı?
-                            // -------------------------------------------------------------------------
-                            // Yalnızca "is_final" anında (Cümle bittiğinde) hesaplıyoruz ki
-                            // hece hece gereksiz yere event fırlatmayalım.
                             if msg.is_final && current_arousal > 0.0 {
                                 let arousal_diff = (current_arousal - acoustic_state.last_arousal).abs();
-
-                                // SADECE AYNI KİŞİ İSE ve DEĞİŞİM BELİRGİNSE (Eşik 0.3'ten 0.15'e çekildi)
-                                if acoustic_state.last_arousal > 0.0
-                                    && acoustic_state.speaker_id == speaker_id
-                                    && (arousal_diff > 0.15 || msg.emotion_proxy != acoustic_state.current_mood) {
-
-                                    debug!(event="DEEP_WATERS_TRIGGERED", trace_id=%trace_id, "Akustik mod değişimi! Fark: {:.2}", arousal_diff);
-
-                                    let _ = tx_out.try_send(PipelineEvent::AcousticMoodShifted {
-                                        previous_mood: acoustic_state.current_mood.clone(),
-                                        current_mood: msg.emotion_proxy.clone(),
-                                        arousal_shift: current_arousal - acoustic_state.last_arousal,
-                                        valence_shift: current_valence - acoustic_state.last_valence,
-                                        speaker_id: speaker_id.clone()
-                                    });
+                                if acoustic_state.last_arousal > 0.0 && acoustic_state.speaker_id == speaker_id && (arousal_diff > 0.15 || msg.emotion_proxy != acoustic_state.current_mood) {
+                                    let _ = tx_out.try_send(PipelineEvent::AcousticMoodShifted { previous_mood: acoustic_state.current_mood.clone(), current_mood: msg.emotion_proxy.clone(), arousal_shift: current_arousal - acoustic_state.last_arousal, valence_shift: current_valence - acoustic_state.last_arousal, speaker_id: speaker_id.clone() });
                                 }
-
-                                // Hafızayı güncelle
-                                acoustic_state.last_arousal = current_arousal;
-                                acoustic_state.last_valence = current_valence;
-                                acoustic_state.current_mood = msg.emotion_proxy.clone();
-                                acoustic_state.speaker_id = speaker_id.clone();
+                                acoustic_state.last_arousal = current_arousal; acoustic_state.last_valence = current_valence; acoustic_state.current_mood = msg.emotion_proxy.clone(); acoustic_state.speaker_id = speaker_id.clone();
                             }
 
                             if !msg.is_final {
                                 if !text.is_empty() && !self.config.listen_only_mode {
                                     info!(event = "SOFTWARE_BARGE_IN_TRIGGERED", trace_id = %trace_id, "⚡ Text-based Barge-in detected.");
-                                    cancel_token.cancel();
-                                    cancel_token = CancellationToken::new();
+                                    cancel_token.cancel(); cancel_token = CancellationToken::new();
                                     let _ = tx_out.try_send(PipelineEvent::ClearBuffer);
                                 }
                             } else if !text.is_empty() {
-                                info!(event = "STT_FINAL_RECEIVED", trace_id = %trace_id, text = %text, "Final transcription received.");
-
-                                // [ARCH-COMPLIANCE FIX]: Listen-Only Mode kontrolü. Sadece dinleyici isek yanıt üretme!
-                                if self.config.listen_only_mode {
-                                    debug!(event = "LISTEN_ONLY_SKIP", trace_id = %trace_id, "Listen-only mode active. Skipping Dialog and TTS generation.");
-                                    continue;
-                                }
+                                if self.config.listen_only_mode { continue; }
 
                                 let ct = cancel_token.child_token();
                                 let clients_clone = self.clients.clone();
                                 let config_clone = self.config.clone();
                                 let tx_out_clone = tx_out.clone();
-                                let s_id = session_id.clone();
-                                let u_id = user_id.clone();
-                                let tr_id = trace_id.clone();
-                                let sp_id = span_id.clone();
-                                let ten_id = tenant_id.clone();
+                                let s_id = session_id.clone(); let u_id = user_id.clone(); let tr_id = trace_id.clone(); let sp_id = span_id.clone(); let ten_id = tenant_id.clone();
 
                                 tokio::spawn(async move {
-                                    if let Err(e) = Self::handle_dialog_tts_phase(
-                                        clients_clone, config_clone, s_id, u_id, tr_id.clone(), sp_id, ten_id, text, tx_out_clone, ct
-                                    ).await {
+                                    if let Err(e) = Self::handle_dialog_tts_phase(clients_clone, config_clone, s_id, u_id, tr_id.clone(), sp_id, ten_id, text, tx_out_clone, ct).await {
                                         warn!(event = "DIALOG_TTS_ERROR", trace_id = %tr_id, error = %e, "Error during Dialog execution.");
                                     }
                                 });
                             }
                         }
-                        Some(Err(e)) => {
-                            error!(event = "STT_STREAM_ERROR", trace_id = %trace_id, error = %e, "STT Stream encountered an error.");
-                            return Err(e.into());
-                        }
-                        None => break,
+                        Some(Err(e)) => { error!(event = "STT_STREAM_ERROR", trace_id = %trace_id, error = %e, "STT Stream error."); return Err(e.into()); }
+                        None => {}
                     }
                 }
             }
         }
-        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
