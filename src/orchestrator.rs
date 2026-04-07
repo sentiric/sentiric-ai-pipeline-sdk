@@ -39,7 +39,6 @@ impl PipelineOrchestrator {
         trace_id: String,
         span_id: String,
         tenant_id: String,
-        // [ARCH-COMPLIANCE FIX]: Sadece Audio değil, Text de alabilen Input Event
         mut rx_input: mpsc::Receiver<PipelineInputEvent>,
         tx_out: mpsc::Sender<PipelineEvent>,
         mut interrupt_rx: mpsc::Receiver<()>,
@@ -49,6 +48,7 @@ impl PipelineOrchestrator {
             trace_id = %trace_id, span_id = %span_id, tenant_id = %tenant_id,
             listen_only = self.config.listen_only_mode,
             speak_only = self.config.speak_only_mode,
+            chat_only = self.config.chat_only_mode,
             "🚀 AI Pipeline started."
         );
 
@@ -62,15 +62,17 @@ impl PipelineOrchestrator {
 
         let (stt_req_tx, stt_req_rx) = mpsc::channel(128);
         let (text_trigger_tx, mut text_trigger_rx) = mpsc::channel::<String>(128);
+
         let is_speak_only = self.config.speak_only_mode;
+        let is_chat_only = self.config.chat_only_mode;
 
         // 1. Giriş Yönlendiricisi (Router)
         tokio::spawn(async move {
             while let Some(input) = rx_input.recv().await {
                 match input {
                     PipelineInputEvent::Audio(chunk) => {
-                        // Megafon modundaysak gelen sesleri yoksay (STT'yi yorma)
-                        if !is_speak_only {
+                        // Ses gelirse; eğer speak_only veya chat_only DEĞİLSE STT'ye yolla
+                        if !is_speak_only && !is_chat_only {
                             let req = TranscribeStreamRequest { audio_chunk: chunk };
                             if stt_req_tx.send(req).await.is_err() {
                                 break;
@@ -78,7 +80,6 @@ impl PipelineOrchestrator {
                         }
                     }
                     PipelineInputEvent::Text(text) => {
-                        // Web'den veya API'den gelen direkt metin
                         if text_trigger_tx.send(text).await.is_err() {
                             break;
                         }
@@ -87,9 +88,9 @@ impl PipelineOrchestrator {
             }
         });
 
-        // 2. STT Bağlantısı (Eğer Speak-Only DEĞİLSE bağlan)
+        // 2. STT Bağlantısı (Eğer Speak-Only veya Chat-Only DEĞİLSE bağlan)
         let mut stt_response_stream = None;
-        if !self.config.speak_only_mode {
+        if !self.config.speak_only_mode && !self.config.chat_only_mode {
             let stt_request = self.clients.inject_metadata(
                 tonic::Request::new(ReceiverStream::new(stt_req_rx)),
                 &trace_id,
@@ -267,6 +268,7 @@ impl PipelineOrchestrator {
 
         let mut dialog_resp_stream = dialog_resp_stream;
         let mut sentence_buffer = String::new();
+        let mut full_chat_text = String::new(); // [YENİ]: Chat UI için birikimli metin
 
         loop {
             tokio::select! {
@@ -279,19 +281,44 @@ impl PipelineOrchestrator {
                         Some(Ok(msg)) => {
                             match msg.payload {
                                 Some(sentiric_contracts::sentiric::dialog::v1::stream_conversation_response::Payload::TextResponse(text_chunk)) => {
-                                    sentence_buffer.push_str(&text_chunk);
 
-                                    if sentence_buffer.contains('.') || sentence_buffer.contains('?') || sentence_buffer.contains('!') || sentence_buffer.contains('\n') {
-                                        let sentence = sentence_buffer.clone();
-                                        sentence_buffer.clear();
-                                        Self::synthesize_and_stream_tts(&mut clients, &config, sentence, &trace_id, &span_id, &tenant_id, &tx_out, &cancel_token).await?;
+                                    if config.chat_only_mode {
+                                        // CHAT MODU: UI'a daktilo efekti için anında fırlat, TTS'i es geç!
+                                        full_chat_text.push_str(&text_chunk);
+                                        let _ = tx_out.try_send(PipelineEvent::Transcript(crate::TranscriptData {
+                                            text: full_chat_text.clone(),
+                                            is_final: false,
+                                            sender: "AI".to_string(),
+                                            emotion: "neutral".to_string(),
+                                            gender: "neutral".to_string(),
+                                            arousal: 0.0, valence: 0.0, speaker_id: "AI_1".to_string(), speaker_vec: vec![], words: vec![],
+                                        }));
+                                    } else {
+                                        // NORMAL MOD: Cümle biriktir ve TTS'e yolla
+                                        sentence_buffer.push_str(&text_chunk);
+                                        if sentence_buffer.contains('.') || sentence_buffer.contains('?') || sentence_buffer.contains('!') || sentence_buffer.contains('\n') {
+                                            let sentence = sentence_buffer.clone();
+                                            sentence_buffer.clear();
+                                            Self::synthesize_and_stream_tts(&mut clients, &config, sentence, &trace_id, &span_id, &tenant_id, &tx_out, &cancel_token).await?;
+                                        }
                                     }
                                 }
                                 Some(sentiric_contracts::sentiric::dialog::v1::stream_conversation_response::Payload::IsFinalResponse(true)) => {
-                                    if !sentence_buffer.trim().is_empty() {
-                                        let sentence = sentence_buffer.clone();
-                                        sentence_buffer.clear();
-                                        Self::synthesize_and_stream_tts(&mut clients, &config, sentence, &trace_id, &span_id, &tenant_id, &tx_out, &cancel_token).await?;
+                                    if config.chat_only_mode {
+                                        // CHAT MODU: Cümle bitti sinyali
+                                        let _ = tx_out.try_send(PipelineEvent::Transcript(crate::TranscriptData {
+                                            text: full_chat_text.clone(),
+                                            is_final: true,
+                                            sender: "AI".to_string(),
+                                            emotion: "neutral".to_string(), gender: "neutral".to_string(), arousal: 0.0, valence: 0.0, speaker_id: "AI_1".to_string(), speaker_vec: vec![], words: vec![],
+                                        }));
+                                    } else {
+                                        // NORMAL MOD: Kalan son cümleyi TTS'e yolla
+                                        if !sentence_buffer.trim().is_empty() {
+                                            let sentence = sentence_buffer.clone();
+                                            sentence_buffer.clear();
+                                            Self::synthesize_and_stream_tts(&mut clients, &config, sentence, &trace_id, &span_id, &tenant_id, &tx_out, &cancel_token).await?;
+                                        }
                                     }
                                 }
                                 _ => {}

@@ -1,4 +1,3 @@
-// Dosya: src/config.rs
 #[derive(Debug, Clone)]
 pub struct SdkConfig {
     pub stt_gateway_url: String,
@@ -17,7 +16,6 @@ pub struct SdkConfig {
 
     pub edge_mode: bool,
     pub listen_only_mode: bool,
-
-    // [YENİ]: Megafon / Broadcast Modu
     pub speak_only_mode: bool,
+    pub chat_only_mode: bool,
 }
