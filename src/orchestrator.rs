@@ -71,7 +71,6 @@ impl PipelineOrchestrator {
             while let Some(input) = rx_input.recv().await {
                 match input {
                     PipelineInputEvent::Audio(chunk) => {
-                        // Ses gelirse; eğer speak_only veya chat_only DEĞİLSE STT'ye yolla
                         if !is_speak_only && !is_chat_only {
                             let req = TranscribeStreamRequest { audio_chunk: chunk };
                             if stt_req_tx.send(req).await.is_err() {
@@ -88,7 +87,7 @@ impl PipelineOrchestrator {
             }
         });
 
-        // 2. STT Bağlantısı (Eğer Speak-Only veya Chat-Only DEĞİLSE bağlan)
+        // 2. STT Bağlantısı
         let mut stt_response_stream = None;
         if !self.config.speak_only_mode && !self.config.chat_only_mode {
             let stt_request = self.clients.inject_metadata(
@@ -117,7 +116,6 @@ impl PipelineOrchestrator {
 
         loop {
             tokio::select! {
-                // DONANIM KESİNTİSİ (VAD)
                 Some(()) = interrupt_rx.recv() => {
                     info!(event = "HARDWARE_BARGE_IN_TRIGGERED", trace_id = %trace_id, "⚡ VAD signal received. Cancelling Tasks.");
                     cancel_token.cancel();
@@ -125,7 +123,6 @@ impl PipelineOrchestrator {
                     let _ = tx_out.try_send(PipelineEvent::ClearBuffer);
                 }
 
-                // DİREKT METİN GİRİŞİ (YENİ: MEGAFON VEYA CHAT)
                 Some(text) = text_trigger_rx.recv() => {
                     info!(event = "TEXT_INPUT_RECEIVED", trace_id = %trace_id, text = %text, "Direct text input received.");
                     cancel_token.cancel();
@@ -144,10 +141,8 @@ impl PipelineOrchestrator {
 
                     tokio::spawn(async move {
                         if config_clone.speak_only_mode {
-                            // DİREKT TTS'E GÖNDER (Bypass Dialog)
                             let _ = Self::synthesize_and_stream_tts(&mut clients_clone, &config_clone, text, &tr_id, &sp_id, &ten_id, &tx_out_clone, &ct).await;
                         } else {
-                            // NORMAL AKIŞ (Omni-Chat mantığı: Metni AI Dialog'a gönder)
                             if let Err(e) = Self::handle_dialog_tts_phase(
                                 clients_clone, config_clone, s_id, u_id, tr_id.clone(), sp_id, ten_id, text, tx_out_clone, ct
                             ).await {
@@ -157,7 +152,6 @@ impl PipelineOrchestrator {
                     });
                 }
 
-                // STT'DEN GELEN SES (GELENEKSEL AKIŞ)
                 res_opt = async {
                     if let Some(stream) = stt_response_stream.as_mut() { stream.next().await }
                     else { futures::future::pending().await }
@@ -176,7 +170,14 @@ impl PipelineOrchestrator {
                             if msg.is_final && current_arousal > 0.0 {
                                 let arousal_diff = (current_arousal - acoustic_state.last_arousal).abs();
                                 if acoustic_state.last_arousal > 0.0 && acoustic_state.speaker_id == speaker_id && (arousal_diff > 0.15 || msg.emotion_proxy != acoustic_state.current_mood) {
-                                    let _ = tx_out.try_send(PipelineEvent::AcousticMoodShifted { previous_mood: acoustic_state.current_mood.clone(), current_mood: msg.emotion_proxy.clone(), arousal_shift: current_arousal - acoustic_state.last_arousal, valence_shift: current_valence - acoustic_state.last_arousal, speaker_id: speaker_id.clone() });
+                                    let _ = tx_out.try_send(PipelineEvent::AcousticMoodShifted {
+                                        session_id: session_id.clone(), // [ARCH-COMPLIANCE FIX]: session_id eklendi
+                                        previous_mood: acoustic_state.current_mood.clone(),
+                                        current_mood: msg.emotion_proxy.clone(),
+                                        arousal_shift: current_arousal - acoustic_state.last_arousal,
+                                        valence_shift: current_valence - acoustic_state.last_arousal,
+                                        speaker_id: speaker_id.clone()
+                                    });
                                 }
                                 acoustic_state.last_arousal = current_arousal; acoustic_state.last_valence = current_valence; acoustic_state.current_mood = msg.emotion_proxy.clone(); acoustic_state.speaker_id = speaker_id.clone();
                             }
@@ -268,14 +269,12 @@ impl PipelineOrchestrator {
 
         let mut dialog_resp_stream = dialog_resp_stream;
         let mut sentence_buffer = String::new();
-        let mut full_chat_text = String::new(); // [YENİ]: Chat UI için birikimli metin
+        let mut full_chat_text = String::new();
 
-        // [ARCH-COMPLIANCE FIX]: Task-01 (Sub-Sentence Chunking) & Task-02 (Barge-in Cleanup)
         loop {
             tokio::select! {
                 _ = cancel_token.cancelled() => {
                     info!(event = "DIALOG_STREAM_ABORTED", trace_id = %trace_id, "⚡ Barge-in: Dropping Dialog task. Clearing buffers.");
-                    // Task-02: Barge-in anında buffer'ları kesin olarak temizle
                     sentence_buffer.clear();
                     full_chat_text.clear();
                     return Ok(());
@@ -298,10 +297,9 @@ impl PipelineOrchestrator {
                                     } else {
                                         sentence_buffer.push_str(&text_chunk);
 
-                                        // Task-01: Gecikmeyi önlemek için noktalama ve uzunluk toleransı eklendi
                                         let ends_with_punct = sentence_buffer.contains('.') || sentence_buffer.contains('?') || sentence_buffer.contains('!');
                                         let ends_with_sub_punct = sentence_buffer.contains(',') || sentence_buffer.contains(';') || sentence_buffer.contains('\n');
-                                        let is_too_long = sentence_buffer.len() > 60 && sentence_buffer.ends_with(' '); // Kelimeyi ortadan kesmemek için boşluk bekle
+                                        let is_too_long = sentence_buffer.len() > 60 && sentence_buffer.ends_with(' ');
 
                                         if ends_with_punct || ends_with_sub_punct || is_too_long {
                                             let sentence = sentence_buffer.clone();

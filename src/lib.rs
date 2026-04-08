@@ -30,7 +30,6 @@ pub struct TranscriptData {
     pub words: Vec<WordData>,
 }
 
-// [YENİ]: Artık Pipeline sadece ses değil, metin de alabilir!
 #[derive(Debug, Clone)]
 pub enum PipelineInputEvent {
     Audio(Vec<u8>),
@@ -43,6 +42,7 @@ pub enum PipelineEvent {
     Transcript(TranscriptData),
     ClearBuffer,
     AcousticMoodShifted {
+        session_id: String, // [ARCH-COMPLIANCE FIX]: Kimlik eşleşmesi için eklendi
         previous_mood: String,
         current_mood: String,
         arousal_shift: f32,
