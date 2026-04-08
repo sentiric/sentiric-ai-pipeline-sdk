@@ -270,10 +270,14 @@ impl PipelineOrchestrator {
         let mut sentence_buffer = String::new();
         let mut full_chat_text = String::new(); // [YENİ]: Chat UI için birikimli metin
 
+        // [ARCH-COMPLIANCE FIX]: Task-01 (Sub-Sentence Chunking) & Task-02 (Barge-in Cleanup)
         loop {
             tokio::select! {
                 _ = cancel_token.cancelled() => {
-                    info!(event = "DIALOG_STREAM_ABORTED", trace_id = %trace_id, "Barge-in: Dropping Dialog task.");
+                    info!(event = "DIALOG_STREAM_ABORTED", trace_id = %trace_id, "⚡ Barge-in: Dropping Dialog task. Clearing buffers.");
+                    // Task-02: Barge-in anında buffer'ları kesin olarak temizle
+                    sentence_buffer.clear();
+                    full_chat_text.clear();
                     return Ok(());
                 }
                 res_opt = dialog_resp_stream.next() => {
@@ -281,9 +285,7 @@ impl PipelineOrchestrator {
                         Some(Ok(msg)) => {
                             match msg.payload {
                                 Some(sentiric_contracts::sentiric::dialog::v1::stream_conversation_response::Payload::TextResponse(text_chunk)) => {
-
                                     if config.chat_only_mode {
-                                        // CHAT MODU: UI'a daktilo efekti için anında fırlat, TTS'i es geç!
                                         full_chat_text.push_str(&text_chunk);
                                         let _ = tx_out.try_send(PipelineEvent::Transcript(crate::TranscriptData {
                                             text: full_chat_text.clone(),
@@ -294,9 +296,14 @@ impl PipelineOrchestrator {
                                             arousal: 0.0, valence: 0.0, speaker_id: "AI_1".to_string(), speaker_vec: vec![], words: vec![],
                                         }));
                                     } else {
-                                        // NORMAL MOD: Cümle biriktir ve TTS'e yolla
                                         sentence_buffer.push_str(&text_chunk);
-                                        if sentence_buffer.contains('.') || sentence_buffer.contains('?') || sentence_buffer.contains('!') || sentence_buffer.contains('\n') {
+
+                                        // Task-01: Gecikmeyi önlemek için noktalama ve uzunluk toleransı eklendi
+                                        let ends_with_punct = sentence_buffer.contains('.') || sentence_buffer.contains('?') || sentence_buffer.contains('!');
+                                        let ends_with_sub_punct = sentence_buffer.contains(',') || sentence_buffer.contains(';') || sentence_buffer.contains('\n');
+                                        let is_too_long = sentence_buffer.len() > 60 && sentence_buffer.ends_with(' '); // Kelimeyi ortadan kesmemek için boşluk bekle
+
+                                        if ends_with_punct || ends_with_sub_punct || is_too_long {
                                             let sentence = sentence_buffer.clone();
                                             sentence_buffer.clear();
                                             Self::synthesize_and_stream_tts(&mut clients, &config, sentence, &trace_id, &span_id, &tenant_id, &tx_out, &cancel_token).await?;
@@ -304,21 +311,10 @@ impl PipelineOrchestrator {
                                     }
                                 }
                                 Some(sentiric_contracts::sentiric::dialog::v1::stream_conversation_response::Payload::IsFinalResponse(true)) => {
-                                    if config.chat_only_mode {
-                                        // CHAT MODU: Cümle bitti sinyali
-                                        let _ = tx_out.try_send(PipelineEvent::Transcript(crate::TranscriptData {
-                                            text: full_chat_text.clone(),
-                                            is_final: true,
-                                            sender: "AI".to_string(),
-                                            emotion: "neutral".to_string(), gender: "neutral".to_string(), arousal: 0.0, valence: 0.0, speaker_id: "AI_1".to_string(), speaker_vec: vec![], words: vec![],
-                                        }));
-                                    } else {
-                                        // NORMAL MOD: Kalan son cümleyi TTS'e yolla
-                                        if !sentence_buffer.trim().is_empty() {
-                                            let sentence = sentence_buffer.clone();
-                                            sentence_buffer.clear();
-                                            Self::synthesize_and_stream_tts(&mut clients, &config, sentence, &trace_id, &span_id, &tenant_id, &tx_out, &cancel_token).await?;
-                                        }
+                                    if !config.chat_only_mode && !sentence_buffer.trim().is_empty() {
+                                        let sentence = sentence_buffer.clone();
+                                        sentence_buffer.clear();
+                                        Self::synthesize_and_stream_tts(&mut clients, &config, sentence, &trace_id, &span_id, &tenant_id, &tx_out, &cancel_token).await?;
                                     }
                                 }
                                 _ => {}
