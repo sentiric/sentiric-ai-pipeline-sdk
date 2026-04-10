@@ -66,6 +66,16 @@ impl PipelineOrchestrator {
         let is_speak_only = self.config.speak_only_mode;
         let is_chat_only = self.config.chat_only_mode;
 
+        // [WAKE-UP TRIGGER]: Arama açıldığında sessizliği bozmak için AI'a ilk selamlama emri verilir.
+        if !is_speak_only && !self.config.listen_only_mode {
+            let init_tx = text_trigger_tx.clone();
+            tokio::spawn(async move {
+                // Bağlantıların stabilize olması için çok kısa bir an bekle
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                let _ = init_tx.send("Lütfen telefonu açtığın için kısaca ve samimi bir şekilde kendini tanıtarak 'Merhaba' de.".to_string()).await;
+            });
+        }
+
         // 1. Giriş Yönlendiricisi (Router)
         tokio::spawn(async move {
             while let Some(input) = rx_input.recv().await {
@@ -124,7 +134,7 @@ impl PipelineOrchestrator {
                 }
 
                 Some(text) = text_trigger_rx.recv() => {
-                    info!(event = "TEXT_INPUT_RECEIVED", trace_id = %trace_id, text = %text, "Direct text input received.");
+                    info!(event = "TEXT_INPUT_RECEIVED", trace_id = %trace_id, text = %text, "Direct text input or Wake-up trigger received.");
                     cancel_token.cancel();
                     cancel_token = CancellationToken::new();
                     let _ = tx_out.try_send(PipelineEvent::ClearBuffer);
@@ -159,6 +169,16 @@ impl PipelineOrchestrator {
                     match res_opt {
                         Some(Ok(msg)) => {
                             let text = msg.partial_transcription.trim().to_string();
+                            
+                            // [HALÜSİNASYON FİLTRESİ]: Çok kısa, sadece "Iıı", "Eee" içeren nefes/gürültü çıktılarını atla.
+                            if msg.is_final && !text.is_empty() {
+                                let lower = text.to_lowercase();
+                                if text.len() < 10 && (lower.contains("ıı") || lower.contains("ee") || lower.contains("mm") || lower.contains("hm")) {
+                                    debug!(event = "STT_FILTERED_HALLUCINATION", trace_id = %trace_id, text = %text, "Filler word/Noise filtered.");
+                                    continue;
+                                }
+                            }
+
                             let mapped_words: Vec<WordData> = msg.words.into_iter().map(|w| WordData { word: w.word, start: w.start, end: w.end, probability: w.probability }).collect();
                             let current_arousal = msg.arousal; let current_valence = msg.valence; let speaker_id = msg.speaker_id.clone();
 
@@ -171,7 +191,7 @@ impl PipelineOrchestrator {
                                 let arousal_diff = (current_arousal - acoustic_state.last_arousal).abs();
                                 if acoustic_state.last_arousal > 0.0 && acoustic_state.speaker_id == speaker_id && (arousal_diff > 0.15 || msg.emotion_proxy != acoustic_state.current_mood) {
                                     let _ = tx_out.try_send(PipelineEvent::AcousticMoodShifted {
-                                        session_id: session_id.clone(), // [ARCH-COMPLIANCE FIX]: session_id eklendi
+                                        session_id: session_id.clone(),
                                         previous_mood: acoustic_state.current_mood.clone(),
                                         current_mood: msg.emotion_proxy.clone(),
                                         arousal_shift: current_arousal - acoustic_state.last_arousal,
@@ -297,9 +317,11 @@ impl PipelineOrchestrator {
                                     } else {
                                         sentence_buffer.push_str(&text_chunk);
 
+                                        // [KUSURSUZ TONLAMA DÜZELTMESİ]: Virgül ile bölmeyi (Chunking) iptal ettik.
+                                        // Cümle sadece ana noktalama işaretlerinde veya aşırı uzunsa (>140 char) bölünecek.
                                         let ends_with_punct = sentence_buffer.contains('.') || sentence_buffer.contains('?') || sentence_buffer.contains('!');
-                                        let ends_with_sub_punct = sentence_buffer.contains(',') || sentence_buffer.contains(';') || sentence_buffer.contains('\n');
-                                        let is_too_long = sentence_buffer.len() > 60 && sentence_buffer.ends_with(' ');
+                                        let ends_with_sub_punct = sentence_buffer.contains('\n'); 
+                                        let is_too_long = sentence_buffer.len() > 140 && sentence_buffer.ends_with(' ');
 
                                         if ends_with_punct || ends_with_sub_punct || is_too_long {
                                             let sentence = sentence_buffer.clone();
