@@ -66,13 +66,17 @@ impl PipelineOrchestrator {
         let is_speak_only = self.config.speak_only_mode;
         let is_chat_only = self.config.chat_only_mode;
 
-        // [WAKE-UP TRIGGER]: Arama açıldığında sessizliği bozmak için AI'a ilk selamlama emri verilir.
+        // [ARCH-COMPLIANCE FIX]: "Smart Media, Dumb Logic" kuralı gereği SDK içindeki
+        // Hardcoded Türkçe karşılama metni silinmiştir.
+        // Onun yerine LLM'i uyandırmak için dil-bağımsız evrensel bir "System Event" fırlatılır.
+        // LLM, kendi sistem promptundaki dile (İngilizce/Almanca/Türkçe) göre doğal bir selam verecektir.
         if !is_speak_only && !self.config.listen_only_mode {
             let init_tx = text_trigger_tx.clone();
             tokio::spawn(async move {
-                // Bağlantıların stabilize olması için çok kısa bir an bekle
                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                let _ = init_tx.send("Lütfen telefonu açtığın için kısaca ve samimi bir şekilde kendini tanıtarak 'Merhaba' de.".to_string()).await;
+                let _ = init_tx
+                    .send("<SYSTEM_EVENT: CALL_CONNECTED>".to_string())
+                    .await;
             });
         }
 
