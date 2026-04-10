@@ -169,7 +169,7 @@ impl PipelineOrchestrator {
                     match res_opt {
                         Some(Ok(msg)) => {
                             let text = msg.partial_transcription.trim().to_string();
-                            
+
                             // [HALÜSİNASYON FİLTRESİ]: Çok kısa, sadece "Iıı", "Eee" içeren nefes/gürültü çıktılarını atla.
                             if msg.is_final && !text.is_empty() {
                                 let lower = text.to_lowercase();
@@ -317,13 +317,15 @@ impl PipelineOrchestrator {
                                     } else {
                                         sentence_buffer.push_str(&text_chunk);
 
-                                        // [KUSURSUZ TONLAMA DÜZELTMESİ]: Virgül ile bölmeyi (Chunking) iptal ettik.
-                                        // Cümle sadece ana noktalama işaretlerinde veya aşırı uzunsa (>140 char) bölünecek.
-                                        let ends_with_punct = sentence_buffer.contains('.') || sentence_buffer.contains('?') || sentence_buffer.contains('!');
-                                        let ends_with_sub_punct = sentence_buffer.contains('\n'); 
-                                        let is_too_long = sentence_buffer.len() > 140 && sentence_buffer.ends_with(' ');
+                                        // [KUSURSUZ TONLAMA DÜZELTMESİ - UX YÜKSELTMESİ]:
+                                        // Virgül, ara noktalar veya kelime ortasındaki noktalar (Örn: "Dr.") tetiklememeli.
+                                        // Cümle sadece ve sadece asıl bitiş işaretleriyle bitiyor SA (boşluklar trimlenerek) bölünür.
+                                        let trimmed = sentence_buffer.trim_end();
+                                        let ends_with_major_punct = trimmed.ends_with('.') || trimmed.ends_with('?') || trimmed.ends_with('!');
+                                        let ends_with_newline = trimmed.ends_with('\n');
+                                        let is_too_long = sentence_buffer.len() > 160 && sentence_buffer.ends_with(' ');
 
-                                        if ends_with_punct || ends_with_sub_punct || is_too_long {
+                                        if (ends_with_major_punct && sentence_buffer.ends_with(' ')) || ends_with_newline || is_too_long {
                                             let sentence = sentence_buffer.clone();
                                             sentence_buffer.clear();
                                             Self::synthesize_and_stream_tts(&mut clients, &config, sentence, &trace_id, &span_id, &tenant_id, &tx_out, &cancel_token).await?;
