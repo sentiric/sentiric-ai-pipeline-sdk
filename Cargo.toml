@@ -1,7 +1,7 @@
 # Dosya: Cargo.toml
 [package]
 name = "sentiric-ai-pipeline-sdk"
-version = "0.1.20"
+version = "0.1.21"
 edition = "2021"
 authors = ["Sentiric Architecture Team"]
 description = "Sentiric Full-Duplex AI Pipeline SDK with Zero-Latency Barge-in"

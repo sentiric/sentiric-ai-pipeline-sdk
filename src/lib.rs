@@ -1,4 +1,4 @@
-// Dosya: src/lib.rs
+// Dosya: sentiric-ai-pipeline-sdk/src/lib.rs
 pub mod clients;
 pub mod config;
 pub mod error;
@@ -42,11 +42,12 @@ pub enum PipelineEvent {
     Transcript(TranscriptData),
     ClearBuffer,
     AcousticMoodShifted {
-        session_id: String, // [ARCH-COMPLIANCE FIX]: Kimlik eşleşmesi için eklendi
+        session_id: String,
         previous_mood: String,
         current_mood: String,
         arousal_shift: f32,
         valence_shift: f32,
         speaker_id: String,
+        speaker_vec: Vec<f32>, // [ARCH-COMPLIANCE FIX]: Biyometrik imza eklendi
     },
 }

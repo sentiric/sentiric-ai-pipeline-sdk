@@ -200,10 +200,14 @@ impl PipelineOrchestrator {
                                         current_mood: msg.emotion_proxy.clone(),
                                         arousal_shift: current_arousal - acoustic_state.last_arousal,
                                         valence_shift: current_valence - acoustic_state.last_arousal,
-                                        speaker_id: speaker_id.clone()
+                                        speaker_id: speaker_id.clone(),
+                                        speaker_vec: msg.speaker_vec.clone() // [ARCH-COMPLIANCE FIX]
                                     });
                                 }
-                                acoustic_state.last_arousal = current_arousal; acoustic_state.last_valence = current_valence; acoustic_state.current_mood = msg.emotion_proxy.clone(); acoustic_state.speaker_id = speaker_id.clone();
+                                acoustic_state.last_arousal = current_arousal;
+                                acoustic_state.last_valence = current_valence;
+                                acoustic_state.current_mood = msg.emotion_proxy.clone();
+                                acoustic_state.speaker_id = speaker_id.clone();
                             }
 
                             if !msg.is_final {
